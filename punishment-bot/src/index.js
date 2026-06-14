@@ -48,8 +48,6 @@ const revertCommand = new SlashCommandBuilder()
   .addStringOption((o) =>
     o.setName("reason").setDescription("Why you're reverting it")
   )
-  // Baseline gate so the command is hidden from regular members.
-  .setDefaultMemberPermissions(PermissionFlagsBits.KickMembers)
   .toJSON();
 
 client.once(Events.ClientReady, async (c) => {
@@ -70,8 +68,19 @@ client.once(Events.ClientReady, async (c) => {
 client.on(Events.InteractionCreate, async (i) => {
   if (!i.isChatInputCommand() || i.commandName !== "revert") return;
 
-  // Extra runtime gate: require a specific role if one is configured.
-  if (REVERT_ROLE_ID && !i.member?.roles?.cache?.has(REVERT_ROLE_ID)) {
+  // Permission: allow server admins, anyone with Kick Members, or anyone with the
+  // configured REVERT_ROLE_ID. If no role is configured, only admins/kickers qualify.
+  const roleId = (REVERT_ROLE_ID || "").trim();
+  const hasRole = roleId ? i.member.roles.cache.has(roleId) : false;
+  const isMod =
+    i.memberPermissions?.has(PermissionFlagsBits.Administrator) ||
+    i.memberPermissions?.has(PermissionFlagsBits.KickMembers) ||
+    false;
+
+  if (!hasRole && !isMod) {
+    console.log(
+      `[revert] DENIED ${i.user.tag} — their role IDs: [${[...i.member.roles.cache.keys()].join(", ")}] | configured REVERT_ROLE_ID: "${roleId}"`
+    );
     return i.reply({
       content: "❌ You don't have permission to revert punishments.",
       flags: MessageFlags.Ephemeral,
