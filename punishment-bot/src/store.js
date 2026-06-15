@@ -14,7 +14,11 @@ function ensure() {
   if (!fs.existsSync(FILE)) {
     fs.writeFileSync(
       FILE,
-      JSON.stringify({ nextId: 1, records: {}, pendingReverts: [] }, null, 2)
+      JSON.stringify(
+        { nextId: 1, records: {}, pendingReverts: [], toolState: {}, admins: [] },
+        null,
+        2
+      )
     );
   }
 }
@@ -26,9 +30,11 @@ function read() {
     d.nextId ??= 1;
     d.records ??= {};
     d.pendingReverts ??= [];
+    d.toolState ??= {};
+    d.admins ??= [];
     return d;
   } catch {
-    return { nextId: 1, records: {}, pendingReverts: [] };
+    return { nextId: 1, records: {}, pendingReverts: [], toolState: {}, admins: [] };
   }
 }
 
@@ -98,4 +104,113 @@ export function getActiveBans(userId) {
         r.expiresAt > now
     )
     .map((r) => ({ id: r.id, type: r.type, expiresAt: r.expiresAt }));
+}
+
+// ---------------------------------------------------------------------------
+// Officer tool-state: strikes + a ban from using the punishment tool itself.
+// Keyed by Roblox userId. banUntil: null = no ban, -1 = permanent, or a future
+// unix-seconds timestamp = timed suspension. 3 strikes also blocks the tool.
+// ---------------------------------------------------------------------------
+function blankTool(username) {
+  return { strikes: 0, banUntil: null, username: username || null };
+}
+
+// Computed status the game + UI consume.
+export function getToolStatus(userId) {
+  const t = read().toolState[String(userId)] || blankTool();
+  const now = Date.now() / 1000;
+  let banUntil = t.banUntil;
+  if (typeof banUntil === "number" && banUntil > 0 && banUntil <= now) banUntil = null; // expired
+
+  const banned = banUntil === -1;
+  const timedSuspended = typeof banUntil === "number" && banUntil > now;
+  const strikeSuspended = (t.strikes || 0) >= 3;
+
+  let state = "ok";
+  let detail = "";
+  let remaining = 0;
+  if (banned) {
+    state = "banned";
+    detail = "permanent";
+  } else if (timedSuspended) {
+    state = "suspended";
+    detail = "timed";
+    remaining = Math.max(0, Math.floor(banUntil - now));
+  } else if (strikeSuspended) {
+    state = "suspended";
+    detail = "strikes";
+  }
+  return {
+    usable: state === "ok",
+    state,
+    detail,
+    remaining,
+    strikes: t.strikes || 0,
+    username: t.username || null,
+  };
+}
+
+export function setToolBan(userId, banUntil, username) {
+  const d = read();
+  const key = String(userId);
+  const t = d.toolState[key] || blankTool(username);
+  t.banUntil = banUntil; // -1 permanent or a future timestamp
+  if (username) t.username = username;
+  d.toolState[key] = t;
+  write(d);
+  return t;
+}
+
+// Lift any tool ban, and clear a maxed-out (3) strike suspension by resetting to 0.
+export function clearToolBlock(userId) {
+  const d = read();
+  const key = String(userId);
+  const t = d.toolState[key] || blankTool();
+  t.banUntil = null;
+  if ((t.strikes || 0) >= 3) t.strikes = 0;
+  d.toolState[key] = t;
+  write(d);
+  return t;
+}
+
+export function addStrike(userId, username) {
+  const d = read();
+  const key = String(userId);
+  const t = d.toolState[key] || blankTool(username);
+  t.strikes = Math.min(3, (t.strikes || 0) + 1);
+  if (username) t.username = username;
+  d.toolState[key] = t;
+  write(d);
+  return t.strikes;
+}
+
+export function removeStrike(userId) {
+  const d = read();
+  const key = String(userId);
+  const t = d.toolState[key] || blankTool();
+  t.strikes = Math.max(0, (t.strikes || 0) - 1);
+  d.toolState[key] = t;
+  write(d);
+  return t.strikes;
+}
+
+// ---- Bot command admins (Discord user IDs allowed to run commands) ----
+export function isAdmin(discordId) {
+  return read().admins.includes(String(discordId));
+}
+export function addAdmin(discordId) {
+  const d = read();
+  const id = String(discordId);
+  if (!d.admins.includes(id)) {
+    d.admins.push(id);
+    write(d);
+  }
+}
+export function removeAdmin(discordId) {
+  const d = read();
+  d.admins = d.admins.filter((x) => x !== String(discordId));
+  write(d);
+}
+export function listAdmins() {
+  return read().admins;
 }
