@@ -16,6 +16,7 @@ import {
   queueRevert,
   getPending,
   ackReverts,
+  getActiveBans,
 } from "./store.js";
 
 const {
@@ -116,15 +117,25 @@ client.on(Events.InteractionCreate, async (i) => {
   if (record.type === "citation") {
     queueRevert({
       id: record.id,
+      type: "citation",
       targetUserId: record.targetUserId,
       amount: record.amount || 0,
     });
     await i.reply(
       `↩️ Reverting citation **#${number}** for **${record.targetName}** — refunding **${record.amount} rublex** in-game (live if they're online, otherwise next time they join).\nReason: ${reason}`
     );
+  } else if (record.type === "tool" || record.type === "team") {
+    queueRevert({
+      id: record.id,
+      type: record.type,
+      targetUserId: record.targetUserId,
+    });
+    await i.reply(
+      `↩️ Reverting the **${record.type} suspension #${number}** for **${record.targetName}** — it'll be lifted in-game (live if they're online; otherwise it simply won't be re-applied when they next join).\nReason: ${reason}`
+    );
   } else {
     await i.reply(
-      `↩️ Marked punishment **#${number}** (${record.type}) as reverted. (No in-game refund applies to this type.)\nReason: ${reason}`
+      `↩️ Marked punishment **#${number}** (${record.type}) as reverted. (No in-game action applies to this type — e.g. a kick, which the player can already rejoin from.)\nReason: ${reason}`
     );
   }
 });
@@ -159,6 +170,7 @@ app.post("/log", auth, async (req, res) => {
       targetUserId: p.targetUserId,
       amount: p.amount,
       detail: p.detail,
+      expiresAt: p.expiresAt,
     });
 
     const embed = new EmbedBuilder()
@@ -180,9 +192,17 @@ app.post("/log", auth, async (req, res) => {
   }
 });
 
-// Roblox -> bot: which citation reverts are waiting to be applied in-game?
+// Roblox -> bot: which reverts are waiting to be applied in-game?
 app.get("/pending", auth, (_req, res) => {
   res.json({ pending: getPending() });
+});
+
+// Roblox -> bot (on player join): which tool/team suspensions are still active for this
+// user? The game re-applies the remaining time so offline time counts and bans resume.
+app.get("/active", auth, (req, res) => {
+  const userId = req.query.userId;
+  if (!userId) return res.json({ active: [] });
+  res.json({ active: getActiveBans(userId) });
 });
 
 // Roblox -> bot: these revert ids were applied in-game; clear them.

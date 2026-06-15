@@ -80,3 +80,22 @@ export function ackReverts(ids) {
   d.pendingReverts = d.pendingReverts.filter((r) => !ids.includes(r.id));
   write(d);
 }
+
+// Tool/team suspensions for a user that are still active (not reverted, not expired).
+// expiresAt is an absolute unix-seconds timestamp the game sent when the ban was issued,
+// so a ban keeps counting down while the player is offline.
+export function getActiveBans(userId) {
+  const d = read();
+  const now = Date.now() / 1000;
+  const uid = Number(userId);
+  return Object.values(d.records)
+    .filter(
+      (r) =>
+        (r.type === "tool" || r.type === "team") &&
+        !r.reverted &&
+        Number(r.targetUserId) === uid &&
+        typeof r.expiresAt === "number" &&
+        r.expiresAt > now
+    )
+    .map((r) => ({ id: r.id, type: r.type, expiresAt: r.expiresAt }));
+}
