@@ -1,7 +1,7 @@
-// Tiny JSON-file store for the pending-revert queue.
-// Roblox is the source of truth for the punishment records themselves (it keeps them
-// in a DataStore). The bot only needs to durably remember which reverts are waiting
-// for the game to pick up. Point DATA_DIR at a Railway Volume so this survives redeploys.
+// Durable store for punishment records + the pending-revert queue.
+// The bot is the source of truth: it assigns each punishment its number, keeps the
+// record, and (for citations) queues a refund for the game to pick up.
+// Point DATA_DIR at a Railway Volume so this survives redeploys.
 
 import fs from "fs";
 import path from "path";
@@ -12,16 +12,23 @@ const FILE = path.join(DATA_DIR, "store.json");
 function ensure() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
   if (!fs.existsSync(FILE)) {
-    fs.writeFileSync(FILE, JSON.stringify({ pendingReverts: [] }, null, 2));
+    fs.writeFileSync(
+      FILE,
+      JSON.stringify({ nextId: 1, records: {}, pendingReverts: [] }, null, 2)
+    );
   }
 }
 
 function read() {
   ensure();
   try {
-    return JSON.parse(fs.readFileSync(FILE, "utf8"));
+    const d = JSON.parse(fs.readFileSync(FILE, "utf8"));
+    d.nextId ??= 1;
+    d.records ??= {};
+    d.pendingReverts ??= [];
+    return d;
   } catch {
-    return { pendingReverts: [] };
+    return { nextId: 1, records: {}, pendingReverts: [] };
   }
 }
 
@@ -30,22 +37,44 @@ function write(data) {
   fs.writeFileSync(FILE, JSON.stringify(data, null, 2));
 }
 
-// Add a revert to the queue (idempotent on id).
-export function queueRevert(id, meta) {
+// Store a new punishment, return its assigned number.
+export function addRecord(record) {
   const d = read();
-  if (!d.pendingReverts.find((r) => r.id === id)) {
-    d.pendingReverts.push({ id, meta, queuedAt: Date.now() });
+  const id = d.nextId;
+  d.nextId = id + 1;
+  d.records[String(id)] = { ...record, id, reverted: false, createdAt: Date.now() };
+  write(d);
+  return id;
+}
+
+export function getRecord(id) {
+  return read().records[String(id)] || null;
+}
+
+// Mark a record reverted. Returns the record, or null if it doesn't exist.
+export function markReverted(id, meta) {
+  const d = read();
+  const r = d.records[String(id)];
+  if (!r) return null;
+  r.reverted = true;
+  r.revertMeta = meta;
+  write(d);
+  return r;
+}
+
+// Queue an in-game revert (used for citations, which need a rublex refund).
+export function queueRevert(entry) {
+  const d = read();
+  if (!d.pendingReverts.find((x) => x.id === entry.id)) {
+    d.pendingReverts.push({ ...entry, queuedAt: Date.now() });
     write(d);
-    return true; // newly queued
   }
-  return false; // already pending
 }
 
 export function getPending() {
   return read().pendingReverts;
 }
 
-// Remove reverts the game has confirmed it applied.
 export function ackReverts(ids) {
   const d = read();
   d.pendingReverts = d.pendingReverts.filter((r) => !ids.includes(r.id));

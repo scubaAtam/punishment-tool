@@ -9,7 +9,14 @@ import {
   PermissionFlagsBits,
   MessageFlags,
 } from "discord.js";
-import { queueRevert, getPending, ackReverts } from "./store.js";
+import {
+  addRecord,
+  getRecord,
+  markReverted,
+  queueRevert,
+  getPending,
+  ackReverts,
+} from "./store.js";
 
 const {
   DISCORD_TOKEN,
@@ -34,7 +41,6 @@ const TYPE_COLORS = {
 };
 const DEFAULT_COLOR = 0x2b2d31;
 
-// The /revert slash command definition.
 const revertCommand = new SlashCommandBuilder()
   .setName("revert")
   .setDescription("Revert a punishment by its number.")
@@ -50,15 +56,17 @@ const revertCommand = new SlashCommandBuilder()
   )
   .toJSON();
 
+async function postToLog(payload) {
+  if (!LOG_CHANNEL_ID) return;
+  const channel = await client.channels.fetch(LOG_CHANNEL_ID);
+  return channel.send(payload);
+}
+
 client.once(Events.ClientReady, async (c) => {
   console.log(`Logged in as ${c.user.tag}`);
-  // Auto-register the slash command (guild-scoped = shows up instantly).
   try {
-    if (GUILD_ID) {
-      await c.application.commands.set([revertCommand], GUILD_ID);
-    } else {
-      await c.application.commands.set([revertCommand]); // global, can take ~1h
-    }
+    if (GUILD_ID) await c.application.commands.set([revertCommand], GUILD_ID);
+    else await c.application.commands.set([revertCommand]);
     console.log("Slash command /revert registered.");
   } catch (e) {
     console.error("Failed to register commands:", e);
@@ -68,8 +76,7 @@ client.once(Events.ClientReady, async (c) => {
 client.on(Events.InteractionCreate, async (i) => {
   if (!i.isChatInputCommand() || i.commandName !== "revert") return;
 
-  // Permission: allow server admins, anyone with Kick Members, or anyone with the
-  // configured REVERT_ROLE_ID. If no role is configured, only admins/kickers qualify.
+  // Permission: server admins, anyone with Kick Members, or the configured role.
   const roleId = (REVERT_ROLE_ID || "").trim();
   const hasRole = roleId ? i.member.roles.cache.has(roleId) : false;
   const isMod =
@@ -90,28 +97,46 @@ client.on(Events.InteractionCreate, async (i) => {
   const number = i.options.getInteger("number");
   const reason = i.options.getString("reason") ?? "No reason given";
 
-  const newlyQueued = queueRevert(number, {
-    by: i.user.tag,
-    byId: i.user.id,
-    reason,
-  });
+  const record = getRecord(number);
+  if (!record) {
+    return i.reply({
+      content: `❓ No punishment **#${number}** found.`,
+      flags: MessageFlags.Ephemeral,
+    });
+  }
+  if (record.reverted) {
+    return i.reply({
+      content: `ℹ️ Punishment **#${number}** was already reverted.`,
+      flags: MessageFlags.Ephemeral,
+    });
+  }
 
-  await i.reply({
-    content: newlyQueued
-      ? `✅ Queued **revert of punishment #${number}**. It will apply in-game shortly (live if the player is online, otherwise the next time they join).`
-      : `ℹ️ Punishment #${number} is already queued for revert.`,
-  });
+  markReverted(number, { by: i.user.tag, byId: i.user.id, reason });
+
+  if (record.type === "citation") {
+    queueRevert({
+      id: record.id,
+      targetUserId: record.targetUserId,
+      amount: record.amount || 0,
+    });
+    await i.reply(
+      `↩️ Reverting citation **#${number}** for **${record.targetName}** — refunding **${record.amount} rublex** in-game (live if they're online, otherwise next time they join).\nReason: ${reason}`
+    );
+  } else {
+    await i.reply(
+      `↩️ Marked punishment **#${number}** (${record.type}) as reverted. (No in-game refund applies to this type.)\nReason: ${reason}`
+    );
+  }
 });
 
 client.login(DISCORD_TOKEN);
 
 // ----------------------------------------------------------------------------
-// Web server — this is what the Roblox game talks to
+// Web server — the Roblox game talks to this
 // ----------------------------------------------------------------------------
 const app = express();
 app.use(express.json());
 
-// Simple shared-secret check on every game-facing route.
 function auth(req, res, next) {
   const token = (req.headers.authorization || "").replace("Bearer ", "");
   if (!SHARED_SECRET || token !== SHARED_SECRET) {
@@ -122,45 +147,51 @@ function auth(req, res, next) {
 
 app.get("/", (_req, res) => res.send("Punishment bot is running."));
 
-// Roblox -> bot: a punishment happened, post it to the log channel.
+// Roblox -> bot: a punishment happened. Assign a number, store it, post an embed.
 app.post("/log", auth, async (req, res) => {
   const p = req.body || {};
   try {
-    const channel = await client.channels.fetch(LOG_CHANNEL_ID);
+    const id = addRecord({
+      type: p.type,
+      officerName: p.officerName,
+      officerUserId: p.officerUserId,
+      targetName: p.targetName,
+      targetUserId: p.targetUserId,
+      amount: p.amount,
+      detail: p.detail,
+    });
+
     const embed = new EmbedBuilder()
-      .setTitle(`📋 Punishment #${p.id} — ${String(p.type || "action").toUpperCase()}`)
+      .setTitle(`📋 Punishment #${id} — ${String(p.type || "action").toUpperCase()}`)
       .setColor(TYPE_COLORS[p.type] ?? DEFAULT_COLOR)
       .addFields(
         { name: "Officer", value: `${p.officerName} (\`${p.officerUserId}\`)`, inline: true },
         { name: "Target", value: `${p.targetName} (\`${p.targetUserId}\`)`, inline: true },
         { name: "Details", value: p.detail ? String(p.detail) : "—" }
       )
-      .setFooter({ text: `Use /revert ${p.id} to undo this` })
+      .setFooter({ text: `Use /revert ${id} to undo this` })
       .setTimestamp(p.timestamp ? Number(p.timestamp) * 1000 : Date.now());
 
-    await channel.send({ embeds: [embed] });
-    res.json({ ok: true });
+    await postToLog({ embeds: [embed] });
+    res.json({ ok: true, id });
   } catch (e) {
     console.error("/log error:", e);
-    res.status(500).json({ error: "failed to post log" });
+    res.status(500).json({ error: "failed to log" });
   }
 });
 
-// Roblox -> bot: which reverts are waiting to be applied?
+// Roblox -> bot: which citation reverts are waiting to be applied in-game?
 app.get("/pending", auth, (_req, res) => {
   res.json({ pending: getPending() });
 });
 
-// Roblox -> bot: confirm these revert ids were applied in-game.
+// Roblox -> bot: these revert ids were applied in-game; clear them.
 app.post("/ack", auth, async (req, res) => {
   const ids = Array.isArray(req.body?.ids) ? req.body.ids : [];
   ackReverts(ids);
-  if (ids.length && LOG_CHANNEL_ID) {
+  if (ids.length) {
     try {
-      const channel = await client.channels.fetch(LOG_CHANNEL_ID);
-      await channel.send(
-        `↩️ Applied revert for punishment ${ids.map((n) => `#${n}`).join(", ")}.`
-      );
+      await postToLog(`✅ In-game refund applied for ${ids.map((n) => `#${n}`).join(", ")}.`);
     } catch {
       /* non-fatal */
     }
@@ -169,4 +200,3 @@ app.post("/ack", auth, async (req, res) => {
 });
 
 app.listen(PORT, () => console.log(`Web server listening on port ${PORT}`));
-
